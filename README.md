@@ -1,9 +1,9 @@
 # Synthetic Data Platform (Social Protection)
 
 A synthetic data generation and anonymization pipeline, built on a social protection
-domain (members, contributions, benefits), that will grow into a full cloud data
-platform: generation, anonymization, cloud storage, infrastructure as code,
-orchestration, transformation, and CI/CD.
+domain (members, contributions, benefits), growing into a full cloud data platform:
+generation, anonymization, cloud storage, infrastructure as code, orchestration,
+transformation, and CI/CD.
 
 ## What this project demonstrates
 
@@ -11,10 +11,11 @@ orchestration, transformation, and CI/CD.
   consistency between related records (a contribution always belongs to a real member)
 - Deterministic, irreversible anonymization (hashing) and partial masking, preserving
   referential integrity across anonymized datasets
-- (Planned) Cloud storage on AWS S3, provisioned with Terraform
-- (Planned) Orchestration with Airflow, transformation with dbt, warehousing in
-  Snowflake
-- (Planned) CI/CD with GitHub Actions
+- Cloud storage on AWS S3, with the bucket brought under Terraform management
+  through `terraform import`
+- Orchestration with Apache Airflow running in Docker (DAG in progress)
+- Reproducible Python environments with uv (`pyproject.toml` and `uv.lock`)
+- (Planned) Transformation with dbt, warehousing in Snowflake, CI/CD with GitHub Actions
 
 ## Domain model
 
@@ -26,27 +27,57 @@ Three related entities, modeling a social protection fund's core data:
 - **Prestation** (benefit payment): id, adherent_id, payment date, amount, reason
 
 Each member can have several contributions and several benefit payments over time,
-which is why these are modeled as three separate entities rather than one flat table,
-mirroring how this data will later live in the Snowflake warehouse.
+which is why these are three separate entities rather than one flat table, mirroring
+how this data will later live in the warehouse.
 
 ## Prerequisites
 
-- **WSL** (Linux on Windows) or any Linux/macOS distribution. Under WSL, avoid working
-  inside `/mnt/c/...` or `/mnt/d/...`: I/O is slower there and pip/venv sometimes run
-  into permission issues. Work under `~/` (the native Linux filesystem) instead.
-- **Python 3.10+**. Check with `python3 --version`.
-- An **AWS account** (free tier) for the upcoming S3 storage step.
+- **WSL 2** (Linux on Windows) or any Linux/macOS distribution. Under WSL, avoid
+  working inside `/mnt/c/...` or `/mnt/d/...`: I/O is slower there and package
+  managers sometimes run into permission issues. Work under `~/` instead.
+- **uv**, the Python package and environment manager: https://docs.astral.sh/uv/
+  (it can also install Python itself, so a separate Python setup is optional)
+- **Docker Desktop** with WSL integration enabled for your distribution
+  (Settings > Resources > WSL Integration). Installing `docker.io` inside WSL is not
+  the recommended path here.
+- **AWS account** (free tier) and the **AWS CLI**, configured with `aws configure`
+- **Terraform**
+
+## AWS cost safeguards
+
+The whole project stays within the free tier if you follow these three rules:
+
+1. Before creating any resource, enable free tier usage alerts in Billing preferences
+   and create an AWS Budget with a low threshold (1 to 5 USD) and an email alert.
+2. Stay in a single region for everything (for example `eu-west-3`), since
+   cross-region transfers can incur charges outside the free tier.
+3. Keep bucket versioning disabled, otherwise every overwritten file is kept as an
+   extra stored version.
+
+Also create a dedicated IAM user for the project instead of using the root account,
+and never commit access keys.
 
 ## Installation
 
 ```bash
 cd ~
-git clone <repo-url> synthetic-data-platform   # or create the folder for a local project
+git clone https://github.com/Indsyra/synthetic-data-platform.git synthetic-data-platform
 cd synthetic-data-platform
-python3 -m venv venv
-source venv/bin/activate
-pip install faker factory_boy
+uv sync
 ```
+
+Dependencies are declared in `pyproject.toml` and pinned in `uv.lock`, so `uv sync`
+recreates the exact same environment (in `.venv/`) on any machine. Both files must be
+committed, while `.venv/` must not.
+
+To add a dependency, use `uv add <package>` (for example
+`uv add faker factory_boy boto3 awscli`) rather than `pip install`, so both files stay
+up to date. If the project has no `pyproject.toml` yet, run `uv init --bare` first: it
+creates a minimal one without touching existing files.
+
+Run scripts with `uv run`, for example `uv run python src/generate.py`, or activate the
+environment once with `source .venv/bin/activate`. The commands in the Usage section
+below assume the environment is active; otherwise prefix them with `uv run`.
 
 ## Usage
 
@@ -56,15 +87,15 @@ pip install faker factory_boy
 python3 src/generate.py
 ```
 
-Generates a configurable number of members (`Adherent`), each linked to one or more
-contributions (`Cotisation`) and benefit payments (`Prestation`), using Factory Boy
-factories built on top of Faker (French locale). Writes three JSON files to `data/`:
-`adherents.json`, `cotisations.json`, `prestations.json`.
+Generates members, contributions and benefit payments with Factory Boy factories built
+on Faker (French locale), and writes three JSON files to `data/`. `LazyFunction`
+generates a fresh value per record, while `LazyAttribute` lets a field depend on
+another field of the same record (a contribution's end date is computed from its own
+start date).
 
-Factory Boy's `LazyFunction` generates a fresh value per record (a name, a date), while
-`LazyAttribute` lets one field depend on another already-generated field on the same
-record, used here so a contribution's end date is always computed from its own start
-date rather than picked independently.
+Two details worth knowing: dates are not natively JSON serializable, so `json.dump`
+needs `default=str`; and an Enum member must be converted with `.value` before being
+stored, otherwise it is serialized as `ClassName.MEMBER`.
 
 ### Step 2: anonymize the data
 
@@ -72,64 +103,131 @@ date rather than picked independently.
 python3 src/anonymize.py
 ```
 
-Reads the three JSON files from `data/`, applies anonymization, and writes the result
-to `data/anonymized_data/`:
+Writes anonymized copies to `data/anonymized_data/`:
 
-- **Hashing** (SHA-256) on every `id` and `adherent_id`: irreversible, and
-  deterministic, meaning the same input always produces the same hash. This is what
-  keeps a contribution correctly linked to its member even after anonymization, both
-  the member's `id` and the contribution's `adherent_id` hash to the same value.
-- **Masking** on `email` (first character kept, rest of the local part replaced with
-  asterisks, domain kept intact) and `iban` (first four and last four characters kept,
-  middle masked).
+- **Hashing** (SHA-256) on every `id` and `adherent_id`. It is irreversible and
+  deterministic: the same input always gives the same hash, so a contribution stays
+  correctly linked to its member after anonymization.
+- **Masking** on `email` (first character kept, domain kept) and `iban` (first four and
+  last four characters kept).
 
-**Point of attention**: anonymization must be applied per record (looping over each
-item of the loaded list), and with the right function for each entity (members need
-`email`/`iban` masking on top of `id` hashing; contributions and benefit payments only
-need `id` and `adherent_id` hashed). Applying a single generic function to a whole list
-instead of its individual items fails silently: no error is raised, but nothing gets
-anonymized, since checking whether a key exists in a list of dictionaries is not the
-same as checking whether it exists in a single dictionary.
+Anonymization must be applied per record, with the right function for each entity.
+Applying a function meant for one dictionary to a whole list fails silently.
+
+### Step 3: upload to AWS S3
+
+```bash
+python3 src/upload.py
+```
+
+Uploads every file of `data/anonymized_data/` to the bucket under the `raw/` prefix,
+using `boto3`, which reads credentials from `~/.aws/credentials`. The `raw/` prefix is a
+convention: transformed data will later live under a different prefix.
+
+Check the result with `aws s3 ls s3://<your-bucket-name>/raw/`.
+
+### Step 4: manage the bucket with Terraform
+
+The bucket was first created by hand in the console, then brought under Terraform
+management instead of being recreated:
+
+```bash
+cd terraform
+terraform init
+terraform import aws_s3_bucket.synthetic_data_bucket <your-bucket-name>
+terraform plan
+```
+
+`terraform import` only fills the state file, it does not write the configuration. The
+`resource` block in `main.tf` must be written by hand, then adjusted until
+`terraform plan` reports no changes. Since version 4 of the AWS provider, versioning,
+policies and encryption are separate resources, so a bare bucket often matches a
+minimal block on the first try.
+
+### Step 5: orchestrate with Airflow
+
+```bash
+cd airflow
+mkdir -p ./dags ./logs ./plugins ./config
+echo -e "AIRFLOW_UID=$(id -u)" > .env
+echo "FERNET_KEY=<generated key>" >> .env
+docker compose up airflow-init
+docker compose up -d
+```
+
+The interface is available at `http://localhost:8080`. Generate the Fernet key (used to
+encrypt sensitive values stored in Airflow's metadata database) without adding
+`cryptography` to the project:
+
+```bash
+uv run --with cryptography python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+uv only manages the local environment. The Airflow containers use their own image and
+their own dependencies, so nothing changes in `docker-compose.yaml` on that side.
+
+The DAG (`airflow/dags/synthetic_data_pipeline.py`) chains three tasks: generate,
+anonymize, upload. Design decisions:
+
+- The containers only see mounted folders, so `src/` and `data/` are mounted as volumes
+  in `docker-compose.yaml`, with absolute paths defined once as constants.
+- The run timestamp is computed once, inside the first task, at execution time and not
+  at file parsing time, then passed to the next tasks through their return values
+  (XCom). Only small values such as file paths should transit through XCom, never
+  datasets.
+- Dependencies are deduced from the data passed between tasks.
 
 ## Project structure
 
 ```
 synthetic-data-platform/
+├── airflow/
+│   ├── dags/                       # Airflow DAGs
+│   ├── docker-compose.yaml         # official Airflow compose file, with extra volumes
+│   └── .env                        # AIRFLOW_UID, FERNET_KEY (not versioned)
 ├── data/
-│   ├── adherents.json              # generated members
-│   ├── cotisations.json            # generated contributions
-│   ├── prestations.json            # generated benefit payments
-│   └── anonymized_data/
-│       ├── adherents.json          # anonymized members
-│       ├── cotisations.json        # anonymized contributions
-│       └── prestations.json        # anonymized benefit payments
+│   ├── *.json                      # generated data
+│   └── anonymized_data/            # anonymized data
 ├── src/
 │   ├── models.py                   # dataclasses: Adherent, Cotisation, Prestation
 │   ├── factories.py                # Factory Boy factories
-│   ├── generate.py                 # step 1: data generation
-│   ├── anonymize.py                # step 2: anonymization
-│   ├── upload.py                   # step 3: AWS S3 upload (in progress)
-│   └── terraform/                  # step 4: infrastructure as code (planned)
-└── venv/
+│   ├── generate.py                 # step 1
+│   ├── anonymize.py                # step 2
+│   └── upload.py                   # step 3
+├── terraform/
+│   └── main.tf                     # provider and S3 bucket (step 4)
+├── pyproject.toml                  # dependencies
+├── uv.lock                         # pinned versions (commit this file)
+└── .venv/                          # local environment (not versioned)
 ```
+
+## Troubleshooting
+
+- **`ModuleNotFoundError` on a new machine**: the virtual environment is per machine and
+  is not copied with the code. Run `uv sync` to recreate it from `uv.lock`.
+- **`permission denied` on the Docker socket after `usermod -aG docker`**: group changes
+  are only loaded at session start. Run `wsl --shutdown` from Windows, then reopen the
+  terminal and check `groups`.
+- **VS Code cannot reconnect to WSL after a shutdown**: delete `~/.vscode-server` from a
+  plain Ubuntu terminal and relaunch with `code .`.
+- **Empty S3 bucket in the console**: refresh the page and open the `raw/` folder, or
+  check with the AWS CLI.
+- **Airflow warns that `FERNET_KEY` is not set**: generate a key and add it to the
+  `.env` file next to `docker-compose.yaml`.
 
 ## Known limitations
 
-- Anonymization is currently irreversible by design (hashing), which fits a
-  throwaway test dataset; a real pseudonymization use case requiring reversibility
-  would need a separate, securely stored mapping table instead.
-- No automated tests yet on the generation/anonymization logic itself.
-- Volume and relationship cardinality (contributions and benefit payments per member)
-  are currently fixed rather than randomized within a range; adjust the generation
-  logic in `generate.py` for a more realistic, variable volume per member.
+- Anonymization is irreversible by design, which fits a throwaway test dataset. A real
+  pseudonymization use case would need a securely stored mapping table.
+- No automated tests yet on the generation and anonymization logic.
+- The volume per member (one contribution and one benefit payment) is fixed rather than
+  randomized within a range.
+- The Airflow DAG is still being finalized.
 
 ## Roadmap
 
-- Upload anonymized data to AWS S3 (`src/upload.py`)
-- Provision the S3 bucket (and later the Snowflake warehouse) with Terraform instead
-  of manual console setup
-- Orchestrate the generation → anonymization → upload → transformation flow with
-  Airflow
+- Finalize and test the Airflow DAG
 - Transform raw data into clean tables with dbt
 - Land transformed data in Snowflake
+- Extend Terraform to the warehouse resources
 - Automate tests and deployment with GitHub Actions
